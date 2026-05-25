@@ -1,0 +1,190 @@
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index d75eed4..42eaf08 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -788,6 +788,10 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut
+     for key in &keys {
+         match key.as_str() {
+             "xkb_config" => {
++                if state.common.ignore_xkb_config_changes.load(std::sync::atomic::Ordering::SeqCst) > 0 {
++                    state.common.ignore_xkb_config_changes.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
++                    continue;
++                }
+                 let value = get_config::<XkbConfig>(&config, "xkb_config");
+                 let seats = state
+                     .common
+@@ -820,6 +824,11 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut
+                         }
+                     }
+                 }
++                let layouts: Vec<&str> = value.layout.split(',').collect();
++                let variants: Vec<&str> = value.variant.split(',').collect();
++                state.common.xkb_keymap_layout_order = layouts.iter()
++                    .zip(variants.iter().chain(std::iter::repeat(&"")))
++                    .map(|(l, v)| (l.to_string(), v.to_string())).collect();
+                 state.common.config.cosmic_conf.xkb_config = value;
+             }
+             "keyboard_config" => {
+diff --git a/src/shell/element/surface.rs b/src/shell/element/surface.rs
+index 1a1e214..35c8f6f 100644
+--- a/src/shell/element/surface.rs
++++ b/src/shell/element/surface.rs
+@@ -121,6 +121,9 @@ struct Sticky(AtomicBool);
+ #[derive(Default)]
+ struct GlobalGeometry(Mutex<Option<Rectangle<i32, Global>>>);
+ 
++#[derive(Default)]
++pub struct SavedKeyboardLayout(pub Mutex<Option<(String, String)>>);
++
+ impl CosmicSurface {
+     pub fn title(&self) -> String {
+         match self.0.underlying_surface() {
+@@ -475,6 +478,16 @@ impl CosmicSurface {
+         }
+     }
+ 
++    pub fn saved_keyboard_layout(&self) -> Option<(String, String)> {
++        self.0.user_data().get_or_insert_threadsafe(SavedKeyboardLayout::default)
++            .0.lock().unwrap().clone()
++    }
++
++    pub fn set_saved_keyboard_layout(&self, layout: String, variant: String) {
++        *self.0.user_data().get_or_insert_threadsafe(SavedKeyboardLayout::default)
++            .0.lock().unwrap() = Some((layout, variant));
++    }
++
+     pub fn set_suspended(&self, suspended: bool) {
+         if let WindowSurface::Wayland(window) = self.0.underlying_surface() {
+             window.with_pending_state(|state| {
+diff --git a/src/shell/focus/mod.rs b/src/shell/focus/mod.rs
+index 5830107..4f9074e 100644
+--- a/src/shell/focus/mod.rs
++++ b/src/shell/focus/mod.rs
+@@ -7,7 +7,7 @@ use crate::{
+ use indexmap::IndexSet;
+ use smithay::{
+     desktop::{PopupUngrabStrategy, layer_map_for_output},
+-    input::{Seat, pointer::MotionEvent},
++    input::{Seat, keyboard::Layout, pointer::MotionEvent},
+     output::Output,
+     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
+     utils::{IsAlive, Point, SERIAL_COUNTER, Serial},
+@@ -391,6 +391,38 @@ fn update_focus_state(
+         }) {
+             keyboard.unset_grab(state);
+         }
++
++        // Per-window keyboard layout: save outgoing, restore incoming.
++        let keymap_order = state.common.xkb_keymap_layout_order.clone();
++        if !keymap_order.is_empty() {
++            let cur = keyboard.with_xkb_state(state, |ctx| ctx.xkb().lock().unwrap().active_layout());
++            let cur_pair = keymap_order.get(cur.0 as usize).cloned().unwrap_or_default();
++            if let Some(prev) = keyboard.current_focus() {
++                if let Some(s) = target_surface(&prev) {
++                    s.set_saved_keyboard_layout(cur_pair.0, cur_pair.1);
++                }
++            }
++            if let Some(new_target) = target {
++                let saved = target_surface(new_target)
++                    .and_then(|s| s.saved_keyboard_layout());
++                let group = saved
++                    .and_then(|(n, v)| keymap_order.iter().position(|(l, var)| *l == n && *var == v))
++                    .unwrap_or_else(|| {
++                        let def = &state.common.default_xkb_layout;
++                        keymap_order.iter().position(|(l, v)| l == &def.0 && v == &def.1)
++                            .unwrap_or(0)
++                    });
++                let target_layout = Layout(group as u32);
++                if target_layout != cur {
++                    let layout_desc = keyboard.with_xkb_state(state, |mut ctx| {
++                        ctx.set_layout(target_layout);
++                        ctx.xkb().lock().unwrap().layout_name(target_layout).to_string()
++                    });
++                    sync_layout_indicator(state, &keymap_order, group, &layout_desc);
++                }
++            }
++        }
++
+         let serial = serial.unwrap_or_else(|| SERIAL_COUNTER.next_serial());
+         state
+             .common
+@@ -731,6 +763,31 @@ fn update_pointer_focus(state: &mut State, seat: &Seat<State>) {
+     }
+ }
+ 
++fn target_surface(t: &KeyboardFocusTarget) -> Option<CosmicSurface> {
++    match t {
++        KeyboardFocusTarget::Element(m) => Some(m.active_window()),
++        KeyboardFocusTarget::Fullscreen(s) => Some(s.clone()),
++        _ => None,
++    }
++}
++
++fn sync_layout_indicator(state: &mut State, keymap_order: &[(String, String)], active: usize, layout_desc: &str) {
++    use cosmic_config::ConfigSet;
++    let mut ordered = vec![keymap_order[active].clone()];
++    ordered.extend(keymap_order.iter().enumerate()
++        .filter(|(i, _)| *i != active).map(|(_, p)| p.clone()));
++    let mut cfg = state.common.config.cosmic_conf.xkb_config.clone();
++    cfg.layout = ordered.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(",");
++    cfg.variant = ordered.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join(",");
++    state.common.config.cosmic_conf.xkb_config = cfg.clone();
++    state.common.ignore_xkb_config_changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++    let _ = state.common.config.cosmic_helper.set("xkb_config", &cfg);
++    let _ = std::process::Command::new("cosmic-osd")
++        .arg("keyboard-layout")
++        .arg(layout_desc)
++        .spawn();
++}
++
+ // Get the top-most layer, if any, with at least one surface with exclusive keyboard interactivity.
+ // Only considers surface in `Top` or `Overlay` layer.
+ fn exclusive_layer_surface_layer(shell: &Shell) -> Option<Layer> {
+diff --git a/src/state.rs b/src/state.rs
+index 88298a9..66b9bc3 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -126,7 +126,7 @@ use std::{
+     collections::HashSet,
+     ffi::OsString,
+     process::Child,
+-    sync::{Arc, LazyLock, Once, atomic::AtomicBool},
++    sync::{Arc, LazyLock, Once, atomic::{AtomicBool, AtomicUsize}},
+     time::{Duration, Instant},
+ };
+ 
+@@ -244,6 +244,9 @@ pub struct Common {
+     pub should_stop: bool,
+ 
+     pub gesture_state: Option<GestureState>,
++    pub ignore_xkb_config_changes: AtomicUsize,
++    pub xkb_keymap_layout_order: Vec<(String, String)>,
++    pub default_xkb_layout: (String, String),
+ 
+     pub kiosk_child: Option<Child>,
+     pub theme: cosmic::Theme,
+@@ -733,6 +736,14 @@ impl State {
+             tracing::warn!(?err, "Failed to initialize dbus handlers");
+         }
+ 
++        let initial_xkb_layout_order: Vec<(String, String)> = {
++            let xkb = &config.cosmic_conf.xkb_config;
++            let layouts: Vec<&str> = xkb.layout.split(',').collect();
++            let variants: Vec<&str> = xkb.variant.split(',').collect();
++            layouts.iter().zip(variants.iter().chain(std::iter::repeat(&"")))
++                .map(|(l, v)| (l.to_string(), v.to_string())).collect()
++        };
++
+         let a11y_state = A11yState::new::<State, _>(dh, client_not_sandboxed);
+ 
+         let a11y_keyboard_monitor_state = A11yKeyboardMonitorState::new(&async_executor);
+@@ -753,6 +764,9 @@ impl State {
+                 startup_done: Arc::new(AtomicBool::new(false)),
+                 should_stop: false,
+                 gesture_state: None,
++                ignore_xkb_config_changes: AtomicUsize::new(0),
++                default_xkb_layout: initial_xkb_layout_order[0].clone(),
++                xkb_keymap_layout_order: initial_xkb_layout_order,
+ 
+                 kiosk_child: None,
+                 theme: cosmic::theme::system_preference(),

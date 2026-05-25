@@ -1,0 +1,34 @@
+diff --git a/src/brightness_device.rs b/src/brightness_device.rs
+index 4187334..0d9a060 100644
+--- a/src/brightness_device.rs
++++ b/src/brightness_device.rs
+@@ -62,8 +62,12 @@ impl BrightnessDevice {
+                 }
+                 last_change = now;
+                 for display in &mut displays {
+-                    if display.update_capabilities().is_err() {
+-                        continue;
++                    if let Err(err) = display.update_capabilities() {
++                        log::warn!(
++                            "DDC capabilities query failed for display {}: {err:?} \
++                             - attempting brightness write anyway",
++                            display.info.id
++                        );
+                     }
+ 
+                     if let Err(err) = display.handle.set_vcp_feature(BRIGHTNESS, brightness) {
+@@ -102,8 +106,12 @@ impl BrightnessDevice {
+ 
+         if ret.is_err() {
+             for mut d in Display::enumerate() {
+-                if d.update_capabilities().is_err() {
+-                    continue;
++                if let Err(err) = d.update_capabilities() {
++                    log::warn!(
++                        "DDC capabilities query failed for display {}: {err:?} \
++                         - attempting brightness read anyway",
++                        d.info.id
++                    );
+                 }
+                 if let Some(feature) = d.info.mccs_database.get(BRIGHTNESS) {
+                     if let Ok(value) = d.handle.get_vcp_feature(feature.code) {

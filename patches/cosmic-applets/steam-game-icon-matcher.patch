@@ -1,0 +1,82 @@
+diff --git a/cosmic-app-list/src/app.rs b/cosmic-app-list/src/app.rs
+--- a/cosmic-app-list/src/app.rs	1970-01-01 02:00:01.000000000 +0200
++++ b/cosmic-app-list/src/app.rs	2026-05-09 00:00:00.000000000 +0300
+@@ -789,6 +789,62 @@
+         focused_toplevels
+     }
+ 
++    fn icons_matched_dir() -> Option<std::path::PathBuf> {
++        let home = std::env::var("HOME").ok()?;
++        let dir = std::path::PathBuf::from(home).join(".local/share/applications/icons-matched");
++        std::fs::create_dir_all(&dir).ok()?;
++        Some(dir)
++    }
++
++    fn find_steam_icon(steam_id: &str) -> Option<String> {
++        let home = std::env::var("HOME").ok()?;
++        let cache_dir = std::path::PathBuf::from(&home)
++            .join(".local/share/Steam/appcache/librarycache")
++            .join(steam_id);
++        // Prefer the square clienticon (root-level .jpg in the cache dir)
++        let mut fallback = None;
++        for entry in std::fs::read_dir(&cache_dir).ok()?.flatten() {
++            let path = entry.path();
++            if path.is_file() && path.extension().map_or(false, |e| e == "jpg" || e == "png") {
++                return Some(path.to_string_lossy().to_string());
++            }
++            if path.is_dir() && fallback.is_none() {
++                let logo = path.join("logo.png");
++                if logo.exists() {
++                    fallback = Some(logo.to_string_lossy().to_string());
++                }
++            }
++        }
++        fallback
++    }
++
++    fn create_steam_desktop_entry(info: &ToplevelInfo) -> bool {
++        let Some(steam_id) = info.app_id.strip_prefix("steam_app_") else {
++            return false;
++        };
++        if !steam_id.chars().all(|c| c.is_ascii_digit()) {
++            return false;
++        }
++        let Some(dir) = Self::icons_matched_dir() else {
++            return false;
++        };
++        let path = dir.join(format!("{}.desktop", info.app_id));
++        if path.exists() {
++            return true;
++        }
++        let icon = Self::find_steam_icon(steam_id).unwrap_or_default();
++        let content = format!(
++            "[Desktop Entry]\nName={}\nExec=steam steam://rungameid/{}\nIcon={}\nType=Application\nStartupWMClass={}\nNoDisplay=true\nCategories=Game;\n",
++            info.title, steam_id, icon, info.app_id,
++        );
++        if std::fs::write(&path, &content).is_ok() {
++            tracing::info!(app_id = %info.app_id, path = %path.display(), "created steam desktop entry");
++            true
++        } else {
++            false
++        }
++    }
++
+     fn find_desktop_entry_for_toplevel(
+         &mut self,
+         info: &ToplevelInfo,
+@@ -828,6 +884,15 @@
+                         }
+                     }
+                 }
++
++                // Generate desktop entry for Steam games
++                if info.app_id.starts_with("steam_app_") && Self::create_steam_desktop_entry(info) {
++                    self.update_desktop_entries();
++                    if let Some(entry) = fde::find_app_by_id(&self.desktop_entries, unicase_appid) {
++                        return entry.clone();
++                    }
++                }
++
+                 fallback_entry
+             }
+         }

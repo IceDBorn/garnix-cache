@@ -1,0 +1,22 @@
+diff --git a/src/backend/render/mod.rs b/src/backend/render/mod.rs
+index 0e22c8ea..ccb0fefa 100644
+--- a/src/backend/render/mod.rs
++++ b/src/backend/render/mod.rs
+@@ -203,16 +203,13 @@ impl IndicatorShader {
+     pub fn focus_element<R: AsGlowRenderer>(
+         renderer: &R,
+         key: impl Into<Key>,
+-        mut element_geo: Rectangle<i32, Local>,
++        element_geo: Rectangle<i32, Local>,
+         thickness: u8,
+         inner_radius: [u8; 4],
+         alpha: f32,
+         scale: f64,
+         active_window_hint: [f32; 3],
+     ) -> PixelShaderElement {
+-        let t = thickness as i32;
+-        element_geo.loc -= (t, t).into();
+-        element_geo.size += (t * 2, t * 2).into();
+         let outer_radius = inner_radius.map(|r| r + thickness);
+
+         IndicatorShader::element(

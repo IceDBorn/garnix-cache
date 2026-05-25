@@ -1,0 +1,119 @@
+diff --git a/src/shell/focus/mod.rs b/src/shell/focus/mod.rs
+index 299cb4f..8140a6f 100644
+--- a/src/shell/focus/mod.rs
++++ b/src/shell/focus/mod.rs
+@@ -400,6 +400,8 @@ fn update_focus_state(
+         keyboard.set_focus(state, target.cloned(), serial);
+         std::mem::drop(keyboard);
+ 
++        dmem_boost_focused_window(state, target);
++
+         //update the focused output or set it to the active output
+         if target.is_some() {
+             // Get focused output calls visible_output_for_surface internally
+@@ -752,3 +754,83 @@ fn exclusive_layer_surface_layer(shell: &Shell) -> Option<Layer> {
+     }
+     layer
+ }
++
++fn dmem_get_surface_pid(target: &KeyboardFocusTarget, state: &State) -> Option<i32> {
++    let surface = match target {
++        KeyboardFocusTarget::Element(m) => Some(m.active_window()),
++        KeyboardFocusTarget::Fullscreen(s) => Some(s.clone()),
++        _ => None,
++    }?;
++    if let Some(x11) = surface.x11_surface() {
++        return x11.pid().map(|p| p as i32);
++    }
++    let wl_surface = surface.wl_surface()?;
++    let client = state.common.display_handle.get_client(wl_surface.id()).ok()?;
++    let creds = client.get_credentials(&state.common.display_handle).ok()?;
++    Some(creds.pid)
++}
++
++fn dmem_pid_to_cgroup(pid: i32) -> Option<String> {
++    let content = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()?;
++    let line = content.lines().find(|l| l.starts_with("0::"))?;
++    let path = line[3..].trim();
++    if path.is_empty() {
++        return None;
++    }
++    Some(format!("/sys/fs/cgroup{}", path))
++}
++
++fn dmem_read_capacity() -> Vec<(String, u64)> {
++    let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/dmem.capacity") else {
++        return Vec::new();
++    };
++    content
++        .lines()
++        .filter_map(|line| {
++            let (device, value) = line.split_once(' ')?;
++            let bytes = value.parse::<u64>().ok()?;
++            Some((device.to_string(), bytes))
++        })
++        .collect()
++}
++
++fn dmem_write_limits(cgroup_path: &str, limits: &[(String, u64)]) {
++    let path = std::path::PathBuf::from(cgroup_path).join("dmem.low");
++    let content: String = limits
++        .iter()
++        .map(|(device, value)| format!("{} {}\n", device, value))
++        .collect();
++    let _ = std::fs::write(path, content);
++}
++
++fn dmem_boost_focused_window(state: &mut State, target: Option<&KeyboardFocusTarget>) {
++    if state.common.dmem_capacity.is_none() {
++        state.common.dmem_capacity = Some(dmem_read_capacity());
++    }
++
++    let capacity = state.common.dmem_capacity.as_ref().unwrap();
++    if capacity.is_empty() {
++        return;
++    }
++
++    let new_cgroup = target
++        .and_then(|t| dmem_get_surface_pid(t, state))
++        .and_then(dmem_pid_to_cgroup);
++
++    if new_cgroup == state.common.dmem_boosted_cgroup {
++        return;
++    }
++
++    let capacity = state.common.dmem_capacity.as_ref().unwrap();
++    let zero_limits: Vec<(String, u64)> = capacity.iter().map(|(d, _)| (d.clone(), 0)).collect();
++
++    if let Some(ref old_cgroup) = state.common.dmem_boosted_cgroup {
++        dmem_write_limits(old_cgroup, &zero_limits);
++    }
++
++    if let Some(ref new_cgroup) = new_cgroup {
++        dmem_write_limits(new_cgroup, capacity);
++    }
++
++    state.common.dmem_boosted_cgroup = new_cgroup;
++}
+diff --git a/src/state.rs b/src/state.rs
+index b10c4d8..69d4bd6 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -247,6 +247,8 @@ pub struct Common {
+ 
+     pub kiosk_child: Option<Child>,
+     pub theme: cosmic::Theme,
++    pub dmem_boosted_cgroup: Option<String>,
++    pub dmem_capacity: Option<Vec<(String, u64)>>,
+ 
+     // wayland state
+     pub compositor_state: CompositorState,
+@@ -755,6 +757,8 @@ impl State {
+ 
+                 kiosk_child: None,
+                 theme: cosmic::theme::system_preference(),
++                dmem_boosted_cgroup: None,
++                dmem_capacity: None,
+ 
+                 compositor_state,
+                 corner_radius_state,

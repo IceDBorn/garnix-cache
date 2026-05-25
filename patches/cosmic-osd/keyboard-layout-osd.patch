@@ -1,0 +1,175 @@
+diff --git a/src/components/app.rs b/src/components/app.rs
+index a71d766..bab5f1c 100644
+--- a/src/components/app.rs
++++ b/src/components/app.rs
+@@ -74,6 +74,10 @@ pub enum OsdTask {
+     Touchpad,
+     #[clap(about = "Toggle the on screen display and start the restart to bios timer")]
+     EnterBios,
++    #[clap(about = "Display keyboard layout indicator")]
++    KeyboardLayout {
++        name: String,
++    },
+     ConfirmHeadphones {
+         #[arg(long)]
+         card_name: String,
+@@ -112,6 +116,7 @@ impl OsdTask {
+             .map(msg),
+             OsdTask::Touchpad => Task::none(),
+             OsdTask::Display => Task::none(),
++            OsdTask::KeyboardLayout { .. } => Task::none(),
+             OsdTask::IdentifyDisplays => Task::none(),
+             OsdTask::DismissDisplayIdentifiers => Task::none(),
+         }
+@@ -252,6 +257,7 @@ pub enum Msg {
+     Action(OsdTask),
+     Confirm,
+     Cancel,
++    KeyboardLayout(String),
+     Countdown,
+     DBus(dbus::Event),
+     Display(Option<DisplayMode>),
+@@ -795,6 +801,9 @@ impl cosmic::Application for App {
+                 }
+                 Task::none()
+             }
++            Msg::KeyboardLayout(name) => {
++                self.create_indicator(osd_indicator::Params::KeyboardLayout(name))
++            }
+             Msg::TouchpadEnabled(enabled) => {
+                 let mut cmds = Vec::new();
+                 let Some(enabled) = enabled else {
+@@ -1193,6 +1202,7 @@ impl cosmic::Application for App {
+                 OsdTask::ConfirmHeadphones { .. } => "confirm-device-type",
+                 OsdTask::Touchpad => "touchpad",
+                 OsdTask::Display => "external-display",
++                OsdTask::KeyboardLayout { .. } => "keyboard-layout",
+                 OsdTask::IdentifyDisplays => "identify-displays",
+                 OsdTask::DismissDisplayIdentifiers => "dismiss-display-identifiers",
+             };
+@@ -1332,7 +1342,9 @@ impl cosmic::Application for App {
+                 let Ok(cmd) = OsdTask::from_str(&action) else {
+                     return Task::none();
+                 };
+-                if let OsdTask::Touchpad = cmd {
++                if let OsdTask::KeyboardLayout { name } = cmd {
++                    return Task::done(cosmic::Action::App(Msg::KeyboardLayout(name)));
++                } else if let OsdTask::Touchpad = cmd {
+                     return cosmic::task::future(async move {
+                         use cosmic_config::{ConfigGet, ConfigSet};
+ 
+diff --git a/src/components/osd_indicator.rs b/src/components/osd_indicator.rs
+index 2936020..c430a49 100644
+--- a/src/components/osd_indicator.rs
++++ b/src/components/osd_indicator.rs
+@@ -33,6 +33,7 @@ pub enum Params {
+     SourceVolume(u32, bool),
+     AirplaneMode(bool),
+     TouchpadEnabled(TouchpadOverride),
++    KeyboardLayout(String),
+ }
+ 
+ impl Params {
+@@ -75,6 +76,7 @@ impl Params {
+             }
+             Self::TouchpadEnabled(TouchpadOverride::None) => "input-touchpad-symbolic",
+             Self::TouchpadEnabled(TouchpadOverride::ForceDisable) => "touchpad-disabled-symbolic",
++            Self::KeyboardLayout(_) => "input-keyboard-symbolic",
+         }
+     }
+ 
+@@ -113,6 +115,7 @@ impl Params {
+             Self::TouchpadEnabled(_) => None,
+             Self::DisplayToggle(_) => None,
+             Self::DisplayNumber(_) => None,
++            Self::KeyboardLayout(_) => None,
+         }
+     }
+ }
+@@ -292,6 +295,11 @@ impl State {
+             return self.view_display_number(display_number);
+         }
+ 
++        // Keyboard layout uses custom rendering with icon + text
++        if let Params::KeyboardLayout(ref name) = self.params {
++            return self.view_keyboard_layout(name);
++        }
++
+         let icon = widget::icon::from_name(self.params.icon_name());
+ 
+         // Use large radius on value-OSD to enforce pill-shape with "Round" system style
+@@ -386,6 +394,74 @@ impl State {
+         .into()
+     }
+ 
++    fn view_keyboard_layout(&self, name: &str) -> Element<'_, Msg> {
++        let icon = widget::icon::from_name("input-keyboard-symbolic").size(32);
++        let label = widget::text::title4(name.to_string())
++            .width(Length::Shrink)
++            .align_x(Alignment::Center);
++
++        let radius = cosmic::theme::active().cosmic().radius_m();
++        let spacing = cosmic::theme::active().cosmic().space_s();
++
++        let osd_contents = widget::container(
++            iced::widget::row![
++                icon,
++                label,
++            ]
++            .spacing(spacing)
++            .align_y(Alignment::Center),
++        )
++        .padding([
++            cosmic::theme::active().cosmic().space_s(),
++            cosmic::theme::active().cosmic().space_l(),
++        ])
++        .align_x(Alignment::Center)
++        .align_y(Alignment::Center)
++        .class(cosmic::theme::Container::custom(move |theme| {
++            widget::container::Style {
++                text_color: Some(theme.cosmic().on_bg_color().into()),
++                background: Some(iced::Color::from(theme.cosmic().bg_color()).into()),
++                border: Border {
++                    radius: radius.into(),
++                    width: 1.0,
++                    color: theme.cosmic().bg_divider().into(),
++                },
++                shadow: Default::default(),
++                icon_color: Some(theme.cosmic().on_bg_color().into()),
++                snap: true,
++            }
++        }));
++
++        let osd_contents = if self.margin.0 != 0 || self.margin.2 != 0 {
++            Element::from(widget::column::with_children(vec![
++                widget::space::vertical().height(self.margin.0 as f32).into(),
++                osd_contents.into(),
++                widget::space::vertical().height(self.margin.2 as f32).into(),
++            ]))
++        } else {
++            osd_contents.into()
++        };
++        let osd_contents = if self.margin.1 != 0 || self.margin.3 != 0 {
++            Element::from(widget::row::with_children(vec![
++                widget::space::horizontal().width(self.margin.1 as f32).into(),
++                osd_contents,
++                widget::space::horizontal().width(self.margin.3 as f32).into(),
++            ]))
++        } else {
++            osd_contents
++        };
++        widget::autosize::autosize(
++            widget::container(osd_contents)
++                .align_x(Alignment::Center)
++                .width(Length::Shrink)
++                .align_bottom(Length::Shrink),
++            OSD_INDICATOR_ID.clone(),
++        )
++        .min_width(1.)
++        .min_height(1.)
++        .into()
++    }
++
+     fn view_display_number(&self, display_number: u32) -> Element<'_, Msg> {
+         const CONTAINER_BASE_SIZE: u16 = 27;
+         const TEXT_SIZE: u16 = 45;

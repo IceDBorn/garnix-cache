@@ -1,0 +1,56 @@
+diff --git a/src/input.rs b/src/input.rs
+index 619e5cf..62fc412 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -18,7 +18,7 @@ pub struct ActiveLayout {
+ }
+ 
+ /// Take the current xkb config and switch the active input source.
+-pub fn source_switch() -> anyhow::Result<()> {
++pub fn source_switch() -> anyhow::Result<String> {
+     let config =
+         cosmic_config::Config::new(COSMIC_COMP_CONFIG, COSMIC_COMP_CONFIG_VERSION).unwrap();
+ 
+@@ -38,6 +38,8 @@ pub fn source_switch() -> anyhow::Result<()> {
+     let prev_layout = active_layouts.remove(0);
+     active_layouts.push(prev_layout);
+ 
++    let new_active_description = active_layouts[0].description.clone();
++
+     update_xkb_config(
+         &config,
+         &mut xkb,
+@@ -45,7 +47,9 @@ pub fn source_switch() -> anyhow::Result<()> {
+             .iter()
+             .map(|layout| (layout.layout.as_str(), layout.variant.as_str())),
+     )
+-    .context("Failed to set config 'xkb_config'")
++    .context("Failed to set config 'xkb_config'")?;
++
++    Ok(new_active_description)
+ }
+ 
+ fn xkb_active_layouts(xkb: &XkbConfig, keyboard_layouts: &[KeyboardLayout]) -> Vec<ActiveLayout> {
+diff --git a/src/main.rs b/src/main.rs
+index 7b32a0a..e82989d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -182,8 +182,16 @@ impl SettingsDaemon {
+ 
+     /// Take the current xkb config and switch the active input source.
+     async fn input_source_switch(&self) {
+-        if let Err(why) = input::source_switch() {
+-            log::error!("error switching xkb input source: {why}");
++        match input::source_switch() {
++            Ok(layout_name) => {
++                let _ = std::process::Command::new("cosmic-osd")
++                    .arg("keyboard-layout")
++                    .arg(&layout_name)
++                    .spawn();
++            }
++            Err(why) => {
++                log::error!("error switching xkb input source: {why}");
++            }
+         }
+     }
+ 

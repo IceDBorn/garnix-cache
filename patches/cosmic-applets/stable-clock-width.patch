@@ -1,0 +1,196 @@
+Pin the panel time applet to a stable maximum width so the proportional-width
+digits of the system font (Inter / similar) don't reflow the panel each second
+when seconds are visible.
+
+The applet's content is wrapped in `cosmic::widget::autosize`, so any change in
+the rendered text width grows or shrinks the Wayland surface and shifts every
+applet to the left of the clock. The fix overlays an invisible "lock" text —
+produced by the same formatter chain run against a worst-case timestamp
+(Wed, Sep 30 2026, 23:58:58) — under the visible time inside an
+`iced::widget::stack`. The first child of `Stack` dictates intrinsic size, so
+the lock pins width to the widest possible rendering for the active format
+(time-only, time+date, time+date+weekday, or strftime). The visible time is
+then centered inside that locked width.
+
+iced 0.14's `Text::color` requires the theme's text class to impl
+`From<StyleFn>`, which cosmic's `theme::Text` does not — so the invisible lock
+is set via `.class(cosmic::theme::Text::Color(Color::TRANSPARENT))` instead.
+The `tnum` font-features alternative is not viable: cosmic-text supports it
+but iced 0.14 doesn't surface OpenType features through the `Font` / `Text`
+API, so enabling it would require patching iced itself.
+
+--- a/cosmic-applet-time/src/window.rs
++++ b/cosmic-applet-time/src/window.rs
+@@ -9,10 +9,10 @@
+     iced::stream,
+     iced::widget::Column,
+     iced::{
+-        Alignment, Length, Rectangle, Subscription,
++        Alignment, Color, Length, Rectangle, Subscription,
+         futures::{SinkExt, StreamExt, channel::mpsc},
+         platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup},
+-        widget::{column, row, rule},
++        widget::{column, row, rule, stack},
+         window,
+     },
+     surface, theme,
+@@ -182,13 +182,87 @@
+     ///
+     /// Do not use to_string(). The formatter panics on invalid specifiers.
+     fn maybe_strftime(&self) -> Option<String> {
++        self.maybe_strftime_for(&self.now)
++    }
++
++    fn maybe_strftime_for(&self, zoned: &Zoned) -> Option<String> {
+         // strftime may override locale specific elements so it stands alone rather
+         // than using ICU.
+         (!self.config.format_strftime.is_empty())
+-            .then(|| strtime::format(&self.config.format_strftime, &self.now).ok())
++            .then(|| strtime::format(&self.config.format_strftime, zoned).ok())
+             .flatten()
+     }
+
++    /// Same formatter chain `horizontal_layout` uses, parameterised on the
++    /// datetime so the rendering can also be evaluated against a worst-case
++    /// timestamp to derive a stable layout-locking string.
++    fn format_horizontal(
++        &self,
++        datetime: &DateTime<icu::calendar::Gregorian>,
++        zoned: &Zoned,
++    ) -> String {
++        if let Some(s) = self.maybe_strftime_for(zoned) {
++            return s;
++        }
++
++        let mut prefs = DateTimeFormatterPreferences::from(self.locale.clone());
++        prefs.hour_cycle = Some(if self.config.military_time {
++            HourCycle::H23
++        } else {
++            HourCycle::H12
++        });
++
++        if self.config.show_date_in_top_panel {
++            if self.config.show_weekday {
++                let mut fs = fieldsets::MDET::medium();
++                if !self.config.show_seconds {
++                    fs = fs.with_time_precision(TimePrecision::Minute);
++                }
++                DateTimeFormatter::try_new(prefs, fs)
++                    .unwrap()
++                    .format(datetime)
++                    .to_string()
++            } else {
++                let mut fs = fieldsets::MDT::medium();
++                if !self.config.show_seconds {
++                    fs = fs.with_time_precision(TimePrecision::Minute);
++                }
++                DateTimeFormatter::try_new(prefs, fs)
++                    .unwrap()
++                    .format(datetime)
++                    .to_string()
++            }
++        } else {
++            let mut fs = fieldsets::T::medium();
++            if !self.config.show_seconds {
++                fs = fs.with_time_precision(TimePrecision::Minute);
++            }
++            DateTimeFormatter::try_new(prefs, fs)
++                .unwrap()
++                .format(datetime)
++                .to_string()
++        }
++    }
++
++    /// Wed Sep 30 2026 23:58:58 — chosen to exercise the widest English
++    /// short weekday and month abbreviation, both H23 and PM hour values,
++    /// and wide digit glyphs in every numeric slot.
++    fn worst_case_zoned(&self) -> Zoned {
++        let dt = jiff::civil::date(2026, 9, 30).at(23, 58, 58, 0);
++        let tz = self
++            .timezone
++            .clone()
++            .unwrap_or_else(|| self.now.time_zone().clone());
++        dt.to_zoned(tz).unwrap_or_else(|_| self.now.clone())
++    }
++
++    fn worst_case_icu_datetime() -> DateTime<icu::calendar::Gregorian> {
++        DateTime {
++            date: IcuDate::try_new_gregorian(2026, 9, 30).unwrap(),
++            time: Time::try_new(23, 58, 58, 0).unwrap(),
++        }
++    }
++
+     fn vertical_layout(&self) -> Element<'_, Message> {
+         let elements: Vec<Element<'_, Message>> = if let Some(strftime) = self.maybe_strftime() {
+             strftime
+@@ -257,52 +331,27 @@
+     }
+
+     fn horizontal_layout(&self) -> Element<'_, Message> {
+-        let formatted_date = if let Some(strftime) = self.maybe_strftime() {
+-            strftime
+-        } else {
+-            let datetime = self.create_datetime(&self.now.date());
+-            let mut prefs = DateTimeFormatterPreferences::from(self.locale.clone());
+-            prefs.hour_cycle = Some(if self.config.military_time {
+-                HourCycle::H23
+-            } else {
+-                HourCycle::H12
+-            });
+-
+-            if self.config.show_date_in_top_panel {
+-                if self.config.show_weekday {
+-                    let mut fs = fieldsets::MDET::medium();
+-                    if !self.config.show_seconds {
+-                        fs = fs.with_time_precision(TimePrecision::Minute);
+-                    }
+-                    DateTimeFormatter::try_new(prefs, fs)
+-                        .unwrap()
+-                        .format(&datetime)
+-                        .to_string()
+-                } else {
+-                    let mut fs = fieldsets::MDT::medium();
+-                    if !self.config.show_seconds {
+-                        fs = fs.with_time_precision(TimePrecision::Minute);
+-                    }
+-                    DateTimeFormatter::try_new(prefs, fs)
+-                        .unwrap()
+-                        .format(&datetime)
+-                        .to_string()
+-                }
+-            } else {
+-                let mut fs = fieldsets::T::medium();
+-                if !self.config.show_seconds {
+-                    fs = fs.with_time_precision(TimePrecision::Minute);
+-                }
+-                DateTimeFormatter::try_new(prefs, fs)
+-                    .unwrap()
+-                    .format(&datetime)
+-                    .to_string()
+-            }
+-        };
++        let visible_str =
++            self.format_horizontal(&self.create_datetime(&self.now.date()), &self.now);
++        // Render the same formatter against a worst-case datetime; the
++        // resulting string pins layout width so per-second digit changes
++        // can't reflow items left of the clock on the panel.
++        let lock_str =
++            self.format_horizontal(&Self::worst_case_icu_datetime(), &self.worst_case_zoned());
++
++        let clock = stack![
++            self.core
++                .applet
++                .text(lock_str)
++                .class(cosmic::theme::Text::Color(Color::TRANSPARENT)),
++            container(self.core.applet.text(visible_str))
++                .width(Length::Fill)
++                .align_x(Alignment::Center),
++        ];
+
+         Element::from(
+             row!(
+-                self.core.applet.text(formatted_date),
++                clock,
+                 container(space::vertical().height(Length::Fixed(
+                     (self.core.applet.suggested_size(true).1
+                         + 2 * self.core.applet.suggested_padding(true).1)
